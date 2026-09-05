@@ -1,0 +1,1595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+/* =========================================================
+   Standalone local-storage adapter for AV Project Command Center.
+   Drop-in replacement for the Claude Artifact `db` + `downloads`
+   capabilities so this page runs as a plain, self-hosted HTML file —
+   no external platform, no account, no network call.
+
+   Trade-off vs. the Claude-hosted version: data lives only in THIS
+   browser's local storage on THIS device. It is not synced across
+   tabs on a schedule (only pushed live to other open tabs of the same
+   browser), not shared across your team, and is lost if the browser's
+   site data is cleared. Use the Claude-hosted version for real
+   multi-person, multi-device use; use this file when you need a
+   quick copy to demo or run on your own domain.
+   ========================================================= */
+(function(){
+  const STORE_KEY = 'avcc_local_store_v1';
+  let store = {};
+  let storageOK = true;
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    store = raw ? JSON.parse(raw) : {};
+  } catch(e){ storageOK = false; store = {}; }
+
+  function persist(){
+    if(!storageOK) return;
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); }
+    catch(e){ /* quota or blocked storage — keep working in memory */ }
+  }
+
+  const listeners = new Map(); // collectionPath -> [{q, next}]
+  let counter = 0;
+  function genId(){ return 'l' + Date.now().toString(36) + (counter++); }
+
+  function computeSnapshot(path, q){
+    const prefix = path + '/';
+    const docs = Object.keys(store)
+      .filter(p => p.startsWith(prefix) && p.slice(prefix.length).indexOf('/') === -1)
+      .map(p => ({ id: p.split('/').pop(), exists: true, data: () => store[p] }));
+    let out = docs;
+    (q.wheres || []).forEach(w => {
+      out = out.filter(d => {
+        const v = d.data()[w.f];
+        if (w.op === '==') return v === w.v;
+        if (w.op === '!=') return v !== w.v;
+        return true;
+      });
+    });
+    if (q.order) {
+      out.sort((a, b) => {
+        const av = a.data()[q.order.f] ?? '', bv = b.data()[q.order.f] ?? '';
+        let c = av < bv ? -1 : av > bv ? 1 : 0;
+        return q.order.dir === 'desc' ? -c : c;
+      });
+    }
+    if (q.lim) out = out.slice(0, q.lim);
+    return { docs: out, size: out.length, empty: out.length === 0, docChanges: () => [], metadata: { fromCache: false, hasPendingWrites: false } };
+  }
+  function notify(path){
+    (listeners.get(path) || []).forEach(({ q, next }) => { try { next(computeSnapshot(path, q)); } catch(e){ console.error(e); } });
+  }
+  function subscribe(path, q, next){
+    const entry = { q, next };
+    if (!listeners.has(path)) listeners.set(path, []);
+    listeners.get(path).push(entry);
+    Promise.resolve().then(() => next(computeSnapshot(path, q)));
+    return () => { const arr = listeners.get(path); const i = arr.indexOf(entry); if (i >= 0) arr.splice(i, 1); };
+  }
+  function makeQuery(path, q){
+    return {
+      path,
+      where: (f, op, v) => makeQuery(path, { ...q, wheres: [...(q.wheres||[]), { f, op, v }] }),
+      orderBy: (f, dir) => makeQuery(path, { ...q, order: { f, dir: dir || 'asc' } }),
+      limit: (n) => makeQuery(path, { ...q, lim: n }),
+      get: async () => computeSnapshot(path, q),
+      onSnapshot: (next) => subscribe(path, q, next),
+      doc: (id) => makeDocRef(path + '/' + (id || genId())),
+      add: async (data) => { const id = genId(); const p = path + '/' + id; store[p] = { ...data }; persist(); notify(path); return makeDocRef(p); },
+    };
+  }
+  function makeDocRef(path){
+    const parent = path.split('/').slice(0, -1).join('/');
+    return {
+      id: path.split('/').pop(),
+      path,
+      get: async () => ({ id: path.split('/').pop(), exists: !!store[path], data: () => store[path], metadata: { fromCache:false, hasPendingWrites:false } }),
+      set: async (data) => { store[path] = { ...data }; persist(); notify(parent); },
+      update: async (data) => {
+        if (!store[path]) throw { code: 'invalid_argument', message: 'document does not exist: ' + path };
+        store[path] = { ...store[path], ...data }; persist(); notify(parent);
+      },
+      delete: async () => { delete store[path]; persist(); notify(parent); },
+      onSnapshot: (next) => {
+        Promise.resolve().then(() => next({ id: path.split('/').pop(), exists: !!store[path], data: () => store[path] }));
+        return () => {};
+      },
+      collection: (sub) => makeQuery(path + '/' + sub, {}),
+    };
+  }
+  const db = { doc: (p) => makeDocRef(p), collection: (p) => makeQuery(p, {}) };
+
+  const downloads = {
+    save: async ({ filename, data }) => {
+      const blob = data instanceof Blob ? data : new Blob([data], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      return { status: 'saved' };
+    }
+  };
+
+  window.claude = { use: async (name) => name === 'db' ? db : name === 'downloads' ? downloads : null };
+
+  /* ---- first-run sample data, mirrors the hosted version's seed ---- */
+  function seedIfEmpty(){
+    const hasAny = Object.keys(store).some(k => k.startsWith('clients/') || k.startsWith('projects/'));
+    if (hasAny) return;
+    const now = new Date().toISOString();
+    const put = (path, data) => { store[path] = data; };
+    put('clients/client-nshm', { name:"National Science & Heritage Museum Trust", contactPerson:"Anjali Mehta", designation:"Director – Capital Projects", email:"anjali.mehta@nshmtrust.org", phone:"+91 22 6789 0123", whatsapp:"+91 98200 12345", address:"Museum Campus, Bhau Daji Lad Road, Byculla, Mumbai 400027", notes:"Government-affiliated trust; procurement runs through empanelled vendors, PMU sign-off required on every change request.", createdAt:"2026-03-20T09:00:00.000Z" });
+    put('projects/proj-museum', { name:"Corporate Museum AV Integration", clientId:"client-nshm", endClient:"National Science & Heritage Museum Trust", consultant:"Spatial Design Collective", location:"Byculla, Mumbai, Maharashtra", projectManager:"Jaihind Yadav", technicalLead:"Jaihind Yadav", siteEngineer:"Suresh Patil", status:"Installation", health:"Yellow", startDate:"2026-04-01", targetDate:"2026-11-30", actualCompletionDate:"", budget:18500000, actualCost:11200000, scope:"Multi-gallery immersive AV integration across six exhibit zones: edge-blended projection mapping in the atrium, an LED timeline wall, interactive touch kiosks, an auditorium AV fit-out, spatial audio throughout, and a central AV control room running Watchout-based show control over a dedicated AV network. Includes a 2-year AMC.", createdAt:"2026-04-01T09:00:00.000Z" });
+    const rooms = {
+      "room-atrium": ["Main Atrium – Projection Mapping","Museum Block A","Ground","Exhibit / Gallery","Installed"],
+      "room-gallery1": ["Gallery 1 – Timeline Wall (LED)","Museum Block A","Ground","Exhibit / Gallery","Testing"],
+      "room-gallery2": ["Gallery 2 – Interactive Kiosks","Museum Block A","First","Exhibit / Gallery","In Progress"],
+      "room-auditorium": ["Auditorium","Museum Block A","Ground","Auditorium","Not Started"],
+      "room-avcr": ["AV Control Room","Museum Block A","Basement","Control Room","Installed"],
+      "room-rack": ["Server / Rack Room","Museum Block A","Basement","Server Room","Installed"],
+      "room-lobby": ["Lobby / Reception","Museum Block A","Ground","Lobby / Reception","Commissioned"],
+    };
+    Object.entries(rooms).forEach(([id,[name,building,floor,type,status]]) => put(`projects/proj-museum/rooms/${id}`, { name, building, floor, type, status }));
+    const equipment = [
+      ["eq-001","Projector","Panasonic","PT-RQ22K","PT-RQ22KEJ","12,000 lm laser phosphor 4K UHD projector, interchangeable lens",1850000,2175000],
+      ["eq-002","LED Display","Absen","PL2.6 Pro","ABS-PL26-PRO","2.6mm pitch indoor LED cabinet, front-service",42000,51000],
+      ["eq-003","Touch Panel","Samsung","QM43R-T","LH43QMREBGCXXY","43in UHD 10-point PCAP touch display",165000,205000],
+      ["eq-004","Audio DSP","Biamp","TesiraFORTE AVB VT4","TFAVBVT4","16x16 networked DSP, Dante/AVB, AEC",285000,335000],
+      ["eq-005","Speaker","JBL Professional","Control 25AV","CONTROL25AV","Compact 2-way surface mount, 70V/100V + 8Ω",9500,12500],
+      ["eq-006","Control Processor","Crestron","CP4N","CP4N","4-series control processor, dual NIC, PoE",245000,288000],
+      ["eq-007","Server","Dataton","WATCHPAX 4","WP4-STD","Watchout 7 media server, dual GPU, 6-display output",675000,795000],
+      ["eq-008","Switch","Cisco","Catalyst 9200L-24P","C9200L-24P-4G","24-port PoE+ managed switch, L3 lite",195000,229000],
+      ["eq-009","UPS","APC","SRT10KXLI","SRT10KXLI","10kVA / 9kW online double-conversion UPS",385000,445000],
+      ["eq-010","Microphone","Shure","MXA920","MXA920-S","Ceiling array microphone, steerable coverage, Dante",195000,235000],
+    ];
+    equipment.forEach(([id,category,manufacturer,model,partNumber,specification,purchasePrice,sellingPrice]) =>
+      put(`equipment_library/${id}`, { category, manufacturer, model, partNumber, specification, purchasePrice, sellingPrice }));
+    const boq = [
+      ["boq-001","Projector","Laser Projector","4K Laser Projector 12,000 ANSI – Atrium Mapping","Panasonic","PT-RQ22K","PT-RQ22KEJ","room-atrium",4,"Nos",1850000,15,5,18,"ProAV Systems Pvt Ltd","10-12 weeks","Lead Time","Installed"],
+      ["boq-002","LED Display","Video Wall","Indoor LED Video Wall – Timeline Wall, 2.6mm pitch","Absen","PL2.6 Pro","ABS-PL26-PRO","room-gallery1",48,"Nos",42000,18,3,18,"DisplayTech India","8 weeks","Available","Received"],
+      ["boq-003","Touch Panel","Interactive Kiosk","43-inch Interactive Touch Kiosk","Samsung","QM43R-T","LH43QMREBGCXXY","room-gallery2",6,"Nos",165000,20,0,18,"ProAV Systems Pvt Ltd","4 weeks","Available","PO Released"],
+      ["boq-004","Audio DSP","DSP Processor","Networked Audio DSP Processor, 16x16","Biamp","TesiraFORTE AVB VT4","TFAVBVT4","room-avcr",2,"Nos",285000,15,0,18,"SoundCraft Distributors","6 weeks","Available","Installed"],
+      ["boq-005","Amplifier","Power Amplifier","4-Channel Networked Power Amplifier, 4x500W","QSC","CX-Q 4K4","CXQ4K4","room-rack",6,"Nos",118000,15,0,18,"SoundCraft Distributors","5 weeks","Available","Installed"],
+      ["boq-006","Speaker","Surface Mount","Compact Surface-Mount Loudspeaker","JBL Professional","Control 25AV","CONTROL25AV","room-atrium",16,"Nos",9500,20,5,18,"SoundCraft Distributors","3 weeks","Available","Installed"],
+      ["boq-007","Control Processor","Show Control","AV Control Processor with Watchout Show-Control Integration","Crestron","CP4N","CP4N","room-avcr",2,"Nos",245000,15,0,18,"ProAV Systems Pvt Ltd","6 weeks","Available","Installed"],
+      ["boq-008","Server","Media Server","Media Server – Watchout Production PC","Dataton","WATCHPAX 4","WP4-STD","room-avcr",2,"Nos",675000,15,0,18,"ProAV Systems Pvt Ltd","8 weeks","Lead Time","PO Released"],
+      ["boq-009","Rack","Server Rack","42U Server Rack with Cable Management","APC / Schneider","AR3100","AR3100","room-rack",3,"Nos",68000,15,0,18,"NetGear Solutions","3 weeks","Available","Installed"],
+      ["boq-010","Switch","PoE Switch","24-Port Managed PoE+ Network Switch","Cisco","Catalyst 9200L-24P","C9200L-24P-4G","room-rack",4,"Nos",195000,15,0,18,"NetGear Solutions","5 weeks","Available","Installed"],
+      ["boq-011","UPS","Online UPS","Online UPS 10kVA with Extended Battery","APC","SRT10KXLI","SRT10KXLI","room-rack",2,"Nos",385000,15,0,18,"NetGear Solutions","6 weeks","Available","Received"],
+      ["boq-012","Cable","Structured Cabling","Fiber + Cat6A Structured Cabling – Backbone","Generic / As per SLD","—","—","room-rack",1,"Lot",620000,12,0,18,"Wirelink Cabling Contractors","—","Available","Installed"],
+      ["boq-013","Other","Services","Installation, Testing & Commissioning Services","—","—","—","",1,"Job",950000,10,0,18,"In-house / Showman Entertainment","—","Available","Ordered"],
+      ["boq-014","Mount","Ceiling Mount","Custom Fabricated Projector Ceiling Mount (Universal)","In-house Fabrication","UPM-Rev3","—","room-atrium",4,"Nos",38000,20,0,18,"Showman Entertainment (fabrication)","2 weeks","Available","Installed"],
+    ];
+    boq.forEach(([id,category,subCategory,description,make,model,partNumber,roomId,qty,unit,rate,marginPct,discountPct,gstPct,vendor,leadTime,availability,procurementStatus]) =>
+      put(`projects/proj-museum/boq_items/${id}`, { category, subCategory, description, make, model, partNumber, roomId, qty, unit, rate, marginPct, discountPct, gstPct, vendor, leadTime, availability, procurementStatus, specification:"", remarks:"" }));
+    const tasks = [
+      ["task-001","Finalize atrium projector edge-blend calibration","room-atrium","Jaihind Yadav","High","In Progress","2026-08-20","2026-09-10"],
+      ["task-002","Commission Timeline Wall LED processor & content playback","room-gallery1","Suresh Patil","Critical","Delayed","2026-08-01","2026-08-28"],
+      ["task-003","Install interactive kiosk enclosures – Gallery 2","room-gallery2","Site Team","Medium","In Progress","2026-08-25","2026-09-15"],
+      ["task-004","Rack cable dressing & labelling – Server Room","room-rack","Suresh Patil","Low","Completed","2026-07-10","2026-07-20"],
+      ["task-005","Client walkthrough & sign-off – Atrium mapping show","room-atrium","Jaihind Yadav","High","Not Started","","2026-09-25"],
+      ["task-006","Submit as-built SLD for Auditorium AV","room-auditorium","Jaihind Yadav","Medium","Waiting","2026-08-10","2026-08-30"],
+      ["task-007","AMC contract handover documentation","","Jaihind Yadav","Low","Not Started","","2026-11-15"],
+      ["task-008","Resolve UPS network card firmware alert","room-rack","Suresh Patil","Critical","Blocked","2026-08-20","2026-08-25"],
+    ];
+    tasks.forEach(([id,title,roomId,responsible,priority,status,startDate,dueDate]) =>
+      put(`projects/proj-museum/tasks/${id}`, { title, roomId, responsible, priority, status, startDate, dueDate, dependency:"", remarks:"" }));
+    const docs = [
+      ["doc-001","Approved GA Drawing – Atrium Projection Mapping","Drawing","Rev C","Approved","2026-06-15","Spatial Design Collective","room-atrium"],
+      ["doc-002","Single Line Diagram – AV Network & Rack","SLD","Rev B","Approved","2026-05-20","Jaihind Yadav","room-rack"],
+      ["doc-003","BOQ – Client Approved (Master)","BOQ","V4","Approved","2026-04-28","Jaihind Yadav",""],
+      ["doc-004","Timeline Wall LED Datasheet – Absen PL2.6 Pro","Datasheet","—","Approved","2026-05-02","Absen","room-gallery1"],
+      ["doc-005","Site Daily Report – Rack Cabling Week 1","Method Statement","—","Submitted","2026-07-08","Suresh Patil","room-rack"],
+      ["doc-006","Client Approval Email – Kiosk Enclosure Finish","Client Approval","—","Approved","2026-08-05","Anjali Mehta (Client)","room-gallery2"],
+    ];
+    docs.forEach(([id,name,category,revision,status,date,author,relatedRoomId]) =>
+      put(`projects/proj-museum/documents/${id}`, { name, category, revision, status, date, author, relatedRoomId, reference:"", notes:"" }));
+    const acts = [
+      ["act-001","Project created","2026-04-01T09:05:00.000Z"],
+      ["act-002","BOQ V4 issued and approved by client","2026-04-28T11:00:00.000Z"],
+      ["act-003","Network & Rack SLD Rev B approved","2026-05-20T10:30:00.000Z"],
+      ["act-004","Atrium GA drawing Rev C approved","2026-06-15T14:00:00.000Z"],
+      ["act-005","Rack cabling and labelling completed","2026-07-20T16:00:00.000Z"],
+      ["act-006","Client approved kiosk enclosure finish","2026-08-05T12:00:00.000Z"],
+      ["act-007","UPS network card firmware alert raised","2026-08-25T09:15:00.000Z"],
+      ["act-008","Timeline Wall LED commissioning delayed — processor RMA","2026-08-28T15:40:00.000Z"],
+      ["act-009","Status changed to Installation","2026-09-01T09:00:00.000Z"],
+    ];
+    acts.forEach(([id,text,ts]) => put(`activity_log/${id}`, { projectId:"proj-museum", projectName:"Corporate Museum AV Integration", text, ts }));
+    persist();
+  }
+  seedIfEmpty();
+
+  window.addEventListener('DOMContentLoaded', () => {
+    const badge = document.querySelector('.env-badge');
+    if (badge) { badge.textContent = storageOK ? '● Local copy · saved in this browser' : '● Local copy · storage unavailable, changes won’t be saved'; }
+  });
+})();
+
+</script>
+</head>
+<body>
+<title>AV Project Command Center</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+:root{
+  --bg:#f4f5f7; --surface:#ffffff; --surface-2:#eef0f4; --surface-3:#e4e7ed;
+  --border:#d7dce3; --border-strong:#b7c0cc;
+  --text:#1a2230; --text-dim:#5c6674; --text-faint:#8993a3;
+  --primary:#1e3a5f; --primary-tint:#e7edf5; --primary-hover:#16304f;
+  --accent:#c96a2e; --accent-tint:#fbeee2;
+  --good:#1f9d55; --good-tint:#e6f7ed;
+  --warn:#b9860b; --warn-tint:#fdf3dc;
+  --critical:#c73e3e; --critical-tint:#fbe9e9;
+  --info:#2f6fed; --info-tint:#e8effd;
+  --shadow: 0 1px 2px rgba(20,26,37,.06), 0 8px 24px -12px rgba(20,26,37,.22);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#10141c; --surface:#171c26; --surface-2:#1e2430; --surface-3:#262d3b;
+    --border:#2b3242; --border-strong:#3b4457;
+    --text:#e7eaf0; --text-dim:#a7b0c0; --text-faint:#6d7690;
+    --primary:#87acdc; --primary-tint:#1c2c42; --primary-hover:#a3c0ea;
+    --accent:#e2934f; --accent-tint:#3a2a1c;
+    --good:#4bc37e; --good-tint:#16301f;
+    --warn:#e0b23e; --warn-tint:#382d10;
+    --critical:#e8706f; --critical-tint:#391d1d;
+    --info:#7ba0f5; --info-tint:#1b2740;
+    --shadow: 0 1px 2px rgba(0,0,0,.35), 0 8px 24px -12px rgba(0,0,0,.55);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#10141c; --surface:#171c26; --surface-2:#1e2430; --surface-3:#262d3b;
+  --border:#2b3242; --border-strong:#3b4457;
+  --text:#e7eaf0; --text-dim:#a7b0c0; --text-faint:#6d7690;
+  --primary:#87acdc; --primary-tint:#1c2c42; --primary-hover:#a3c0ea;
+  --accent:#e2934f; --accent-tint:#3a2a1c;
+  --good:#4bc37e; --good-tint:#16301f;
+  --warn:#e0b23e; --warn-tint:#382d10;
+  --critical:#e8706f; --critical-tint:#391d1d;
+  --info:#7ba0f5; --info-tint:#1b2740;
+  --shadow: 0 1px 2px rgba(0,0,0,.35), 0 8px 24px -12px rgba(0,0,0,.55);
+}
+
+*{box-sizing:border-box;}
+html,body{height:100%;}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:'IBM Plex Sans', system-ui, sans-serif; font-size:14px; line-height:1.5;
+}
+h1,h2,h3,h4{font-family:'Archivo', system-ui, sans-serif; font-weight:700; text-wrap:balance; color:var(--text); margin:0;}
+code,.mono{font-family:'IBM Plex Mono', monospace;}
+a{color:var(--primary); text-decoration:none;}
+button{font-family:inherit;}
+::selection{background:var(--accent-tint);}
+
+/* ---------- shell ---------- */
+#topbar{
+  display:flex; align-items:center; justify-content:space-between; gap:14px;
+  padding:11px 20px; background:var(--surface); border-bottom:1px solid var(--border);
+  position:sticky; top:0; z-index:20;
+}
+.brand{font-family:'Archivo'; font-weight:800; font-size:16px; letter-spacing:.01em; display:flex; align-items:center; gap:8px;}
+.brand .mark{
+  width:26px; height:26px; border-radius:6px; background:var(--primary); color:#fff;
+  display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:800; font-family:'IBM Plex Mono';
+}
+.brand span.dim{color:var(--text-faint); font-weight:500; font-size:12.5px; margin-left:2px;}
+.env-badge{
+  font-family:'IBM Plex Mono'; font-size:10.5px; letter-spacing:.06em; text-transform:uppercase;
+  background:var(--good-tint); color:var(--good); padding:3px 9px; border-radius:20px; font-weight:600;
+}
+#shell{display:grid; grid-template-columns:200px 1fr; min-height:calc(100% - 48px);}
+#sidebar{
+  border-right:1px solid var(--border); background:var(--surface); padding:16px 10px; display:flex; flex-direction:column;
+  position:sticky; top:48px; align-self:start; height:calc(100vh - 48px);
+}
+#sidebar a{
+  display:flex; align-items:center; gap:9px; padding:9px 12px; border-radius:6px; color:var(--text-dim);
+  font-size:13.3px; font-weight:500; margin-bottom:2px;
+}
+#sidebar a:hover{background:var(--surface-2); color:var(--text);}
+#sidebar a.active{background:var(--primary-tint); color:var(--primary); font-weight:600;}
+#sidebar a .ico{width:16px; text-align:center; font-size:13px;}
+.sidebar-footer{margin-top:auto; padding:10px 12px; border-top:1px solid var(--border);}
+.sidebar-footer a{font-size:11.5px; color:var(--text-faint); display:block;}
+.sidebar-footer a:hover{color:var(--accent);}
+#app{padding:22px 26px 60px; max-width:1180px;}
+@media (max-width:860px){
+  #shell{grid-template-columns:1fr;}
+  #sidebar{position:static; height:auto; flex-direction:row; overflow-x:auto; padding:8px 10px; gap:4px;}
+  #sidebar a{white-space:nowrap;}
+  .sidebar-footer{display:none;}
+}
+
+/* ---------- basics ---------- */
+.page-head{display:flex; justify-content:space-between; align-items:flex-start; gap:14px; margin-bottom:18px; flex-wrap:wrap;}
+.page-head h1{font-size:21px;}
+.page-head .lede{color:var(--text-dim); font-size:12.8px; margin-top:3px;}
+.crumb{font-size:12px; color:var(--text-faint); margin-bottom:6px;}
+.crumb a{color:var(--text-faint);}
+.crumb a:hover{color:var(--primary);}
+
+.btn{
+  border:1px solid var(--border-strong); background:var(--surface); color:var(--text);
+  padding:8px 14px; border-radius:6px; font-size:12.8px; font-weight:600; cursor:pointer; white-space:nowrap;
+}
+.btn:hover{background:var(--surface-2);}
+.btn.primary{background:var(--primary); border-color:var(--primary); color:#fff;}
+.btn.primary:hover{background:var(--primary-hover);}
+.btn.ghost{background:transparent; border-color:transparent;}
+.btn.ghost:hover{background:var(--surface-2);}
+.btn.danger-ghost{background:transparent; border-color:var(--critical); color:var(--critical);}
+.btn.danger-ghost:hover{background:var(--critical-tint);}
+.btn.sm{padding:5px 10px; font-size:11.8px;}
+.btn:disabled{opacity:.55; cursor:default;}
+.btn:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible{outline:2px solid var(--accent); outline-offset:1px;}
+.icon-btn{border:none; background:transparent; color:var(--text-dim); font-size:15px; cursor:pointer; padding:4px 6px; border-radius:5px;}
+.icon-btn:hover{background:var(--surface-2); color:var(--text);}
+.row-actions{display:flex; gap:4px; justify-content:flex-end;}
+.link-btn{background:none;border:none;color:var(--primary);cursor:pointer;font:inherit;padding:0;font-weight:600;}
+.link-btn:hover{text-decoration:underline;}
+
+/* ---------- kpi ---------- */
+.kpi-grid{display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-bottom:20px;}
+@media (max-width:960px){.kpi-grid{grid-template-columns:repeat(2,1fr);}}
+.kpi-card{background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px 16px; box-shadow:var(--shadow);}
+.kpi-card .lbl{font-size:10.8px; text-transform:uppercase; letter-spacing:.06em; color:var(--text-faint); font-family:'IBM Plex Mono'; margin-bottom:6px;}
+.kpi-card .val{font-family:'Archivo'; font-size:23px; font-weight:800; color:var(--text); font-variant-numeric:tabular-nums;}
+.kpi-card .sub{font-size:11.3px; color:var(--text-faint); margin-top:3px;}
+.kpi-card .sub.critical{color:var(--critical); font-weight:600;}
+
+/* ---------- cards / panels ---------- */
+.panel{background:var(--surface); border:1px solid var(--border); border-radius:8px; box-shadow:var(--shadow); margin-bottom:18px; overflow:hidden;}
+.panel-head{display:flex; justify-content:space-between; align-items:center; padding:13px 16px; border-bottom:1px solid var(--border); gap:10px; flex-wrap:wrap;}
+.panel-head h3{font-size:13.5px;}
+.panel-body{padding:14px 16px;}
+.two-col{display:grid; grid-template-columns:1.5fr 1fr; gap:16px; align-items:start;}
+@media (max-width:900px){.two-col{grid-template-columns:1fr;}}
+
+/* ---------- tables ---------- */
+.tblwrap{overflow-x:auto;}
+table{border-collapse:collapse; width:100%; font-size:12.7px;}
+th{
+  text-align:left; font-family:'IBM Plex Mono'; font-size:10.2px; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--text-faint); border-bottom:1.5px solid var(--border-strong); padding:8px 10px; background:var(--surface-2);
+  white-space:nowrap; position:sticky; top:0;
+}
+td{padding:8px 10px; border-bottom:1px solid var(--border); color:var(--text-dim); vertical-align:middle;}
+tbody tr:hover{background:var(--surface-2);}
+tbody tr.clickable{cursor:pointer;}
+td.num, th.num{text-align:right; font-variant-numeric:tabular-nums; font-family:'IBM Plex Mono';}
+td strong,.k{color:var(--text); font-weight:600;}
+tr.overdue td{background:var(--critical-tint);}
+tfoot td{border-top:1.5px solid var(--border-strong); border-bottom:none; font-weight:700; color:var(--text); background:var(--surface-2);}
+.empty-row td{text-align:center; color:var(--text-faint); padding:26px; font-style:italic;}
+
+/* ---------- pills / dots ---------- */
+.pill{display:inline-block; padding:2px 9px; border-radius:20px; font-size:10.8px; font-weight:600; font-family:'IBM Plex Mono'; white-space:nowrap;}
+.pill.good{background:var(--good-tint); color:var(--good);}
+.pill.warn{background:var(--warn-tint); color:var(--warn);}
+.pill.critical{background:var(--critical-tint); color:var(--critical);}
+.pill.info{background:var(--info-tint); color:var(--info);}
+.pill.dim{background:var(--surface-3); color:var(--text-dim);}
+.dot{width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:5px; flex:none;}
+.dot.good{background:var(--good);} .dot.warn{background:var(--warn);} .dot.critical{background:var(--critical);} .dot.info{background:var(--info);} .dot.dim{background:var(--text-faint);}
+.progressbar{width:70px; height:6px; border-radius:4px; background:var(--surface-3); overflow:hidden; display:inline-block; vertical-align:middle;}
+.progressbar > i{display:block; height:100%; background:var(--primary);}
+
+/* ---------- filters ---------- */
+.filters{display:flex; gap:8px; flex-wrap:wrap; align-items:center;}
+.filters input[type=text],.filters select{
+  border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:6px; padding:7px 10px; font-size:12.5px; font-family:inherit;
+}
+.filters input[type=text]{min-width:200px;}
+
+/* ---------- tabs ---------- */
+.tabs{display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:16px; overflow-x:auto;}
+.tab{padding:9px 14px; font-size:12.8px; font-weight:600; color:var(--text-dim); border-bottom:2px solid transparent; white-space:nowrap; cursor:pointer;}
+.tab:hover{color:var(--text);}
+.tab.active{color:var(--primary); border-bottom-color:var(--primary);}
+.tab .cnt{color:var(--text-faint); font-weight:500; margin-left:3px;}
+.tab.active .cnt{color:var(--primary);}
+
+/* ---------- project header ---------- */
+.proj-header{background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 18px; margin-bottom:16px; box-shadow:var(--shadow);}
+.proj-header-top{display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;}
+.proj-header h1{font-size:19px;}
+.proj-meta{display:flex; flex-wrap:wrap; gap:16px; margin-top:12px; font-size:12px;}
+.proj-meta .mi{display:flex; flex-direction:column; gap:2px;}
+.proj-meta .mi .l{color:var(--text-faint); font-family:'IBM Plex Mono'; font-size:10px; text-transform:uppercase; letter-spacing:.05em;}
+.proj-meta .mi .v{color:var(--text); font-weight:600;}
+
+/* ---------- activity ---------- */
+.activity-item{display:flex; gap:10px; padding:9px 0; border-bottom:1px solid var(--border); font-size:12.4px;}
+.activity-item:last-child{border-bottom:none;}
+.activity-item .dot{margin-top:5px;}
+.activity-item .txt{color:var(--text);}
+.activity-item .meta{color:var(--text-faint); font-size:11px; margin-top:1px;}
+
+/* ---------- forms / modal ---------- */
+.modal-backdrop{position:fixed; inset:0; background:rgba(15,18,25,.5); display:flex; align-items:flex-start; justify-content:center; padding:5vh 16px; z-index:100; overflow-y:auto;}
+.modal{background:var(--surface); border-radius:10px; width:100%; max-width:640px; box-shadow:0 20px 60px -10px rgba(0,0,0,.4); border:1px solid var(--border);}
+.modal-head{display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--border);}
+.modal-head h3{font-size:15.5px;}
+.modal-body{padding:18px 20px; display:grid; grid-template-columns:1fr 1fr; gap:12px 14px; max-height:64vh; overflow-y:auto;}
+.field{display:flex; flex-direction:column; gap:5px;}
+.field.wide{grid-column:1/-1;}
+.field label{font-size:11.3px; font-weight:600; color:var(--text-dim);}
+.field input,.field select,.field textarea{
+  border:1px solid var(--border); background:var(--bg); color:var(--text); border-radius:6px; padding:8px 10px; font-size:13px; font-family:inherit; width:100%;
+}
+.field textarea{resize:vertical; min-height:56px;}
+.field .hint{font-size:10.6px; color:var(--text-faint);}
+.modal-foot{display:flex; justify-content:space-between; align-items:center; padding:14px 20px; border-top:1px solid var(--border);}
+
+/* ---------- misc ---------- */
+.callout{border-left:3px solid var(--accent); background:var(--accent-tint); border-radius:0 6px 6px 0; padding:11px 14px; margin:0 0 16px; font-size:12.6px; color:var(--text);}
+.callout strong{color:var(--accent);}
+.empty-state{text-align:center; padding:60px 20px; color:var(--text-dim);}
+.empty-state h2{font-size:16px; margin-bottom:8px;}
+.empty-state p{font-size:13px; color:var(--text-faint); max-width:44ch; margin:0 auto 16px;}
+
+#toastRoot{position:fixed; bottom:18px; right:18px; z-index:200; display:flex; flex-direction:column; gap:8px;}
+.toast{
+  background:var(--text); color:var(--bg); padding:10px 16px; border-radius:7px; font-size:12.8px; font-weight:600;
+  box-shadow:0 8px 24px rgba(0,0,0,.25); opacity:0; transform:translateY(8px); transition:.25s;
+}
+.toast.show{opacity:1; transform:translateY(0);}
+.toast.good{background:var(--good); color:#fff;}
+.toast.critical{background:var(--critical); color:#fff;}
+.toast.warn{background:var(--warn); color:#1a1200;}
+</style>
+
+<div id="topbar">
+  <a class="brand" href="#/"><span class="mark">AV</span>Command Center<span class="dim">Phase 1</span></a>
+  <span class="env-badge">● Live · Sample data loaded</span>
+</div>
+<div id="shell">
+  <nav id="sidebar">
+    <a href="#/" data-nav="dashboard"><span class="ico">◧</span>Dashboard</a>
+    <a href="#/projects" data-nav="projects"><span class="ico">▤</span>Projects</a>
+    <a href="#/clients" data-nav="clients"><span class="ico">◍</span>Clients</a>
+    <a href="#/equipment" data-nav="equipment"><span class="ico">▣</span>Equipment Library</a>
+    <div class="sidebar-footer">
+      <a href="https://claude.ai/code/artifact/b1357b37-2f61-48da-98f6-1915f96716f4" target="_blank" rel="noopener">Architecture Blueprint ↗</a>
+    </div>
+  </nav>
+  <main id="app"></main>
+</div>
+<div id="modalRoot"></div>
+<div id="toastRoot"></div>
+
+<script>
+/* =========================================================
+   AV PROJECT COMMAND CENTER — Phase 1 MVP
+   ========================================================= */
+
+/* ---------- enums ---------- */
+const EQUIPMENT_CATEGORIES = ["Display","Projector","Projection Screen","LED Display","Video Wall","Processor","Video Matrix","Switch","Router","Firewall","Access Point","Computer","Server","NUC","Media Player","Touch Panel","Control Processor","Audio DSP","Amplifier","Mixer","Speaker","Directional Speaker","Microphone","Wireless Microphone","DI Box","Cable","Connector","Rack","UPS","PDU","Mount","Bracket","Sensor","Lighting","Other"];
+const PROJECT_STATUS = ["Planning","Design","Procurement","Installation","Testing","Commissioning","Handover","Completed","On Hold"];
+const HEALTH_OPTS = ["Green","Yellow","Red","Blue"];
+const HEALTH_COLOR = {Green:"good",Yellow:"warn",Red:"critical",Blue:"info"};
+const ROOM_TYPES = ["Meeting Room","Exhibit / Gallery","Control Room","Server Room","Auditorium","Lobby / Reception","Common Area","Other"];
+const ROOM_STATUS = ["Not Started","In Progress","Installed","Testing","Commissioned"];
+const UNITS = ["Nos","Set","Mtr","Lot","Job","Pair"];
+const AVAILABILITY = ["Available","Lead Time","Backorder","Discontinued"];
+const PROC_STATUS = ["Not Required","RFQ","Quotation Received","PO Released","Ordered","In Transit","Received","Installed"];
+const TASK_PRIORITY = ["Low","Medium","High","Critical"];
+const TASK_STATUS = ["Not Started","In Progress","Waiting","Completed","Delayed","Blocked"];
+const DOC_CATEGORY = ["BOQ","Quotation","PO","Invoice","Datasheet","Drawing","SLD","Network Diagram","Rack Drawing","Layout","Method Statement","Test Report","Commissioning Report","MOM","Client Approval","Warranty","AMC","Handover Document","Photo","Video","Other"];
+const DOC_STATUS = ["Draft","Submitted","Under Review","Approved","Rejected"];
+
+/* ---------- utils ---------- */
+function escapeHtml(s){ return String(s===undefined||s===null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtINR(n){
+  n = Math.round(Number(n)||0);
+  const neg = n<0; n = Math.abs(n);
+  let s = String(n);
+  let lastThree = s.length>3 ? s.slice(-3) : s;
+  let rest = s.length>3 ? s.slice(0,-3) : '';
+  if(rest) rest = rest.replace(/\B(?=(\d{2})+(?!\d))/g, ',');
+  return (neg?'-':'') + '₹' + (rest ? rest+',' : '') + lastThree;
+}
+function fmtDate(s){
+  if(!s) return '—';
+  const d = new Date(s+'T00:00:00');
+  if(isNaN(d)) return s;
+  return d.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
+}
+function todayStr(){ return new Date().toISOString().slice(0,10); }
+function isOverdue(dueDate, status){ return !!dueDate && dueDate < todayStr() && status!=='Completed'; }
+function pill(text, cls){ return `<span class="pill ${cls}">${escapeHtml(text||'—')}</span>`; }
+function dot(cls, title){ return `<span class="dot ${cls}" title="${escapeHtml(title||'')}"></span>`; }
+function healthPillCls(h){ return HEALTH_COLOR[h] || 'dim'; }
+function taskStatusCls(s){
+  if(s==='Completed') return 'good';
+  if(s==='In Progress') return 'info';
+  if(s==='Delayed'||s==='Blocked') return 'critical';
+  return 'dim';
+}
+function priorityCls(p){
+  if(p==='Critical') return 'critical'; if(p==='High') return 'warn'; if(p==='Medium') return 'info'; return 'dim';
+}
+function docStatusCls(s){
+  if(s==='Approved') return 'good'; if(s==='Rejected') return 'critical'; if(s==='Under Review'||s==='Submitted') return 'info'; return 'dim';
+}
+function roomStatusCls(s){
+  if(s==='Commissioned') return 'good'; if(s==='Testing'||s==='Installed') return 'info'; if(s==='In Progress') return 'warn'; return 'dim';
+}
+function procStatusCls(s){
+  if(s==='Installed'||s==='Received') return 'good'; if(s==='Ordered'||s==='In Transit'||s==='PO Released') return 'info'; if(s==='Not Required') return 'dim'; return 'warn';
+}
+function csvEscape(v){ v = v===undefined||v===null?'':String(v); return /[",\n\r]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v; }
+
+function boqCalc(item){
+  const qty = Number(item.qty)||0, rate = Number(item.rate)||0, margin = Number(item.marginPct)||0,
+        disc = Number(item.discountPct)||0, gst = Number(item.gstPct)||0;
+  const sellRate = rate * (1+margin/100);
+  const gross = sellRate*qty;
+  const discAmt = gross*disc/100;
+  const afterDisc = gross-discAmt;
+  const gstAmt = afterDisc*gst/100;
+  const total = afterDisc+gstAmt;
+  const cost = rate*qty;
+  const profit = afterDisc-cost;
+  const profitPct = afterDisc>0 ? (profit/afterDisc*100) : 0;
+  return {sellRate,gross,discAmt,afterDisc,gstAmt,total,cost,profit,profitPct};
+}
+
+/* ---------- toast ---------- */
+function toast(msg, kind='info', ms=3400){
+  const root = document.getElementById('toastRoot');
+  const el = document.createElement('div');
+  el.className = 'toast '+(kind==='info'?'':kind);
+  el.textContent = msg;
+  root.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add('show'));
+  setTimeout(()=>{ el.classList.remove('show'); setTimeout(()=>el.remove(),300); }, ms);
+}
+
+/* ---------- state ---------- */
+let db = null, downloadsCap = null;
+let clients = [], projects = [], equipment = [];
+let portfolioTasks = {}, portfolioBoq = {};
+let portfolioSubs = {};
+let currentProjectId = null, projectSubs = [];
+let pdata = { rooms:[], docs:[], activity:[] };
+let renderScheduled = false;
+
+function scheduleRender(){
+  if(renderScheduled) return;
+  renderScheduled = true;
+  setTimeout(()=>{ renderScheduled = false; renderRoute(); }, 0);
+}
+
+function syncPortfolioSubs(){
+  const ids = new Set(projects.map(p=>p.id));
+  ids.forEach(pid=>{
+    [['tasks',portfolioTasks],['boq_items',portfolioBoq]].forEach(([coll,bucket])=>{
+      const key = coll+':'+pid;
+      if(!portfolioSubs[key]){
+        portfolioSubs[key] = db.collection(`projects/${pid}/${coll}`).onSnapshot(snap=>{
+          bucket[pid] = snap.docs.map(d=>({id:d.id, projectId:pid, ...d.data()}));
+          scheduleRender();
+        }, err=>console.error('sub error', coll, err));
+      }
+    });
+  });
+  Object.keys(portfolioSubs).forEach(key=>{
+    const pid = key.split(':')[1];
+    if(!ids.has(pid)){
+      portfolioSubs[key](); delete portfolioSubs[key];
+      delete portfolioTasks[pid]; delete portfolioBoq[pid];
+    }
+  });
+}
+
+function ensureProjectSubs(id){
+  if(currentProjectId===id) return;
+  projectSubs.forEach(u=>u());
+  projectSubs = [];
+  currentProjectId = id;
+  pdata = { rooms:[], docs:[], activity:[] };
+  projectSubs.push(db.collection(`projects/${id}/rooms`).onSnapshot(snap=>{
+    pdata.rooms = snap.docs.map(d=>({id:d.id,...d.data()})); scheduleRender();
+  }));
+  projectSubs.push(db.collection(`projects/${id}/documents`).onSnapshot(snap=>{
+    pdata.docs = snap.docs.map(d=>({id:d.id,...d.data()})); scheduleRender();
+  }));
+  projectSubs.push(db.collection('activity_log').where('projectId','==',id).orderBy('ts','desc').limit(15).onSnapshot(snap=>{
+    pdata.activity = snap.docs.map(d=>({id:d.id,...d.data()})); scheduleRender();
+  }, err=>console.error('activity sub', err)));
+}
+
+function addActivity(projectId, projectName, text){
+  if(!db) return;
+  db.collection('activity_log').add({ projectId, projectName, text, ts: new Date().toISOString() }).catch(()=>{});
+}
+
+/* ---------- modal / form engine ---------- */
+function fieldInput(f, value){
+  const val = value===undefined||value===null ? '' : value;
+  const id = 'f_'+f.key;
+  if(f.type==='select'){
+    const opts = typeof f.options==='function' ? f.options() : f.options;
+    return `<select id="${id}">${!f.required?'<option value="">—</option>':''}${opts.map(o=>{
+      const ov = typeof o==='object' ? o.value : o;
+      const ol = typeof o==='object' ? o.label : o;
+      return `<option value="${escapeHtml(ov)}" ${String(ov)===String(val)?'selected':''}>${escapeHtml(ol)}</option>`;
+    }).join('')}</select>`;
+  }
+  if(f.type==='textarea'){
+    return `<textarea id="${id}" rows="${f.rows||3}" placeholder="${escapeHtml(f.placeholder||'')}">${escapeHtml(val)}</textarea>`;
+  }
+  return `<input id="${id}" type="${f.type||'text'}" value="${escapeHtml(String(val))}" ${f.step?`step="${f.step}"`:''} placeholder="${escapeHtml(f.placeholder||'')}">`;
+}
+
+function openModal({title, fields, initial={}, onSave, onDelete, saveLabel='Save', note}){
+  const root = document.getElementById('modalRoot');
+  root.innerHTML = `
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal">
+      <div class="modal-head"><h3>${escapeHtml(title)}</h3><button class="icon-btn" onclick="closeModal()">✕</button></div>
+      ${note?`<div style="padding:12px 20px 0;"><div class="callout" style="margin:0;">${note}</div></div>`:''}
+      <div class="modal-body">
+        ${fields.map(f=>`<div class="field ${f.wide?'wide':''}"><label>${escapeHtml(f.label)}${f.required?' *':''}</label>${fieldInput(f, initial[f.key])}${f.hint?`<span class="hint">${escapeHtml(f.hint)}</span>`:''}</div>`).join('')}
+      </div>
+      <div class="modal-foot">
+        ${onDelete?'<button class="btn danger-ghost sm" id="modalDeleteBtn">Delete</button>':'<span></span>'}
+        <div style="display:flex;gap:8px;">
+          <button class="btn ghost" onclick="closeModal()">Cancel</button>
+          <button class="btn primary" id="modalSaveBtn">${escapeHtml(saveLabel)}</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  document.getElementById('modalBackdrop').addEventListener('mousedown', e=>{ if(e.target.id==='modalBackdrop') closeModal(); });
+  document.getElementById('modalSaveBtn').onclick = async ()=>{
+    const data = {};
+    fields.forEach(f=>{
+      const el = document.getElementById('f_'+f.key);
+      let v = el.value;
+      if(f.type==='number') v = v===''? 0 : parseFloat(v);
+      data[f.key] = v;
+    });
+    const missing = fields.filter(f=>f.required && (data[f.key]===''||data[f.key]===undefined||data[f.key]===null));
+    if(missing.length){ toast('Please fill: '+missing.map(f=>f.label).join(', '), 'critical'); return; }
+    const btn = document.getElementById('modalSaveBtn');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try{ await onSave(data); closeModal(); }
+    catch(e){ toast('Save failed: '+(e&&e.message||e), 'critical'); btn.disabled=false; btn.textContent=saveLabel; }
+  };
+  if(onDelete){
+    document.getElementById('modalDeleteBtn').onclick = async ()=>{
+      if(!confirm('Delete this record? This cannot be undone.')) return;
+      try{ await onDelete(); closeModal(); }
+      catch(e){ toast('Delete failed: '+(e&&e.message||e), 'critical'); }
+    };
+  }
+}
+function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
+
+/* ---------- CSV export ---------- */
+async function exportCSV(filename, headers, rows){
+  if(!downloadsCap){ toast('Downloads are not available in this view.', 'warn'); return; }
+  const csv = [headers.join(',')].concat(rows.map(r=>r.map(csvEscape).join(','))).join('\r\n');
+  try{ await downloadsCap.save({filename, data: csv}); toast('Downloaded '+filename, 'good'); }
+  catch(e){ if(e && e.code==='declined') return; toast('Download failed: '+(e&&e.message||e), 'critical'); }
+}
+
+/* ---------- shared lookups ---------- */
+function clientName(id){ const c = clients.find(c=>c.id===id); return c ? c.name : '—'; }
+function projectRoomOptions(){ return pdata.rooms.map(r=>({value:r.id, label:r.name})); }
+function roomName(id){ const r = pdata.rooms.find(r=>r.id===id); return r ? r.name : '—'; }
+function taskListFor(pid){ return portfolioTasks[pid] || []; }
+function boqListFor(pid){ return portfolioBoq[pid] || []; }
+function projectCompletion(pid){
+  const tasks = taskListFor(pid);
+  if(!tasks.length) return null;
+  const done = tasks.filter(t=>t.status==='Completed').length;
+  return Math.round(done/tasks.length*100);
+}
+
+/* ============================================================
+   ROUTER
+   ============================================================ */
+function getParts(){
+  let h = location.hash || '';
+  h = h.replace(/^#\/?/, '');
+  return h.split('/').filter(Boolean);
+}
+function setActiveNav(key){
+  document.querySelectorAll('#sidebar a[data-nav]').forEach(a=>{
+    a.classList.toggle('active', a.getAttribute('data-nav')===key);
+  });
+}
+function renderRoute(){
+  if(!db){ return; }
+  const parts = getParts();
+  const app = document.getElementById('app');
+  if(!parts.length){ setActiveNav('dashboard'); return renderDashboard(app); }
+  if(parts[0]==='projects'){
+    setActiveNav('projects');
+    if(parts[1]==='new') return renderProjectForm(app);
+    return renderProjectsList(app);
+  }
+  if(parts[0]==='project' && parts[1]){
+    setActiveNav('projects');
+    return renderProjectWorkspace(app, parts[1], parts[2]||'overview');
+  }
+  if(parts[0]==='clients'){
+    setActiveNav('clients');
+    if(parts[1]==='new') return renderClientForm(app);
+    return renderClientsList(app);
+  }
+  if(parts[0]==='client' && parts[1]){
+    setActiveNav('clients');
+    return renderClientDetail(app, parts[1]);
+  }
+  if(parts[0]==='equipment'){
+    setActiveNav('equipment');
+    return renderEquipmentLibrary(app);
+  }
+  setActiveNav('dashboard'); renderDashboard(app);
+}
+
+/* ============================================================
+   DASHBOARD
+   ============================================================ */
+function renderDashboard(app){
+  const active = projects.filter(p=>p.status!=='Completed' && p.status!=='On Hold');
+  const budgetTotal = projects.reduce((s,p)=>s+(Number(p.budget)||0),0);
+  const boqTotal = Object.values(portfolioBoq).flat().reduce((s,i)=>s+boqCalc(i).total,0);
+  const allTasks = Object.values(portfolioTasks).flat();
+  const openTasks = allTasks.filter(t=>t.status!=='Completed');
+  const overdueTasks = openTasks.filter(t=>isOverdue(t.dueDate,t.status));
+
+  if(!projects.length){
+    app.innerHTML = `
+      <div class="page-head"><div><h1>Dashboard</h1><div class="lede">Portfolio overview across every active AV project.</div></div></div>
+      <div class="empty-state panel">
+        <h2>No projects yet</h2>
+        <p>Create your first project to start tracking BOQ, rooms, tasks and documents in one place.</p>
+        <button class="btn primary" onclick="location.hash='#/projects/new'">+ New Project</button>
+      </div>`;
+    return;
+  }
+
+  app.innerHTML = `
+    <div class="page-head">
+      <div><h1>Dashboard</h1><div class="lede">Portfolio overview across every active AV project.</div></div>
+      <button class="btn primary" onclick="location.hash='#/projects/new'">+ New Project</button>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi-card"><div class="lbl">Projects</div><div class="val">${projects.length}</div><div class="sub">${active.length} active</div></div>
+      <div class="kpi-card"><div class="lbl">Portfolio Budget</div><div class="val">${fmtINR(budgetTotal)}</div><div class="sub">across all projects</div></div>
+      <div class="kpi-card"><div class="lbl">Live BOQ Value</div><div class="val">${fmtINR(boqTotal)}</div><div class="sub">computed from current BOQ lines</div></div>
+      <div class="kpi-card"><div class="lbl">Open Tasks</div><div class="val">${openTasks.length}</div><div class="sub ${overdueTasks.length?'critical':''}">${overdueTasks.length} overdue</div></div>
+      <div class="kpi-card"><div class="lbl">Health</div><div class="val">${projects.filter(p=>p.health==='Red').length}</div><div class="sub critical">projects flagged red</div></div>
+    </div>
+
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><h3>Projects</h3><a class="link-btn" href="#/projects">View all →</a></div>
+        <div class="tblwrap"><table>
+          <thead><tr><th>Project</th><th>Client</th><th>Status</th><th>Health</th><th>Completion</th><th>Target</th></tr></thead>
+          <tbody>
+            ${projects.slice().sort((a,b)=>(a.targetDate||'9999').localeCompare(b.targetDate||'9999')).map(p=>{
+              const comp = projectCompletion(p.id);
+              return `<tr class="clickable" onclick="location.hash='#/project/${p.id}'">
+                <td><strong>${escapeHtml(p.name)}</strong></td>
+                <td>${escapeHtml(clientName(p.clientId))}</td>
+                <td>${pill(p.status,'dim')}</td>
+                <td>${dot(healthPillCls(p.health), p.health)}${escapeHtml(p.health||'—')}</td>
+                <td>${comp===null?'<span style="color:var(--text-faint)">—</span>':`<span class="progressbar"><i style="width:${comp}%"></i></span> ${comp}%`}</td>
+                <td>${fmtDate(p.targetDate)}</td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table></div>
+      </div>
+
+      <div>
+        <div class="panel">
+          <div class="panel-head"><h3>Needs Attention</h3></div>
+          <div class="panel-body">
+            ${overdueTasks.length===0 ? `<p style="color:var(--text-faint); font-size:12.6px; margin:0;">No overdue tasks. Nice work.</p>` :
+              overdueTasks.slice(0,6).map(t=>{
+                const proj = projects.find(p=>p.id===t.projectId);
+                return `<div class="activity-item">
+                  <span class="dot critical"></span>
+                  <div><div class="txt">${escapeHtml(t.title)}</div><div class="meta">${escapeHtml(proj?proj.name:'')} · due ${fmtDate(t.dueDate)}</div></div>
+                </div>`;
+              }).join('')
+            }
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>Recent Activity</h3></div>
+          <div class="panel-body" id="dash-activity">
+            <p style="color:var(--text-faint); font-size:12.6px; margin:0;">Loading…</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  db.collection('activity_log').orderBy('ts','desc').limit(10).get().then(snap=>{
+    const el = document.getElementById('dash-activity');
+    if(!el) return;
+    if(snap.empty){ el.innerHTML = `<p style="color:var(--text-faint); font-size:12.6px; margin:0;">No activity yet.</p>`; return; }
+    el.innerHTML = snap.docs.map(d=>{
+      const a = d.data();
+      return `<div class="activity-item"><span class="dot info"></span><div><div class="txt">${escapeHtml(a.text)}</div><div class="meta">${escapeHtml(a.projectName||'')} · ${fmtDate((a.ts||'').slice(0,10))}</div></div></div>`;
+    }).join('');
+  }).catch(()=>{});
+}
+
+/* ============================================================
+   PROJECTS
+   ============================================================ */
+function projectFormFields(){
+  return [
+    {key:'name', label:'Project Name', required:true, wide:true},
+    {key:'clientId', label:'Client', type:'select', required:true, options:()=>clients.map(c=>({value:c.id,label:c.name}))},
+    {key:'endClient', label:'End Client'},
+    {key:'consultant', label:'Consultant'},
+    {key:'location', label:'Project Location', wide:true},
+    {key:'projectManager', label:'Project Manager'},
+    {key:'technicalLead', label:'Technical Lead'},
+    {key:'siteEngineer', label:'Site Engineer'},
+    {key:'status', label:'Status', type:'select', options:PROJECT_STATUS, required:true},
+    {key:'health', label:'Health', type:'select', options:HEALTH_OPTS, required:true},
+    {key:'startDate', label:'Start Date', type:'date'},
+    {key:'targetDate', label:'Target Completion', type:'date'},
+    {key:'actualCompletionDate', label:'Actual Completion', type:'date'},
+    {key:'budget', label:'Budget (₹)', type:'number', step:'1000'},
+    {key:'actualCost', label:'Actual Cost (₹)', type:'number', step:'1000'},
+    {key:'scope', label:'Scope Summary', type:'textarea', wide:true, rows:3},
+  ];
+}
+function renderProjectForm(app, project){
+  const isEdit = !!project;
+  app.innerHTML = `<div class="crumb"><a href="#/projects">Projects</a> / ${isEdit?'Edit':'New'}</div><div class="page-head"><h1>${isEdit?'Edit Project':'New Project'}</h1></div><div id="pf-slot"></div>`;
+  if(!clients.length){
+    document.getElementById('pf-slot').innerHTML = `<div class="callout"><strong>Add a client first —</strong> every project needs a client on file. <button class="btn sm primary" style="margin-left:8px;" onclick="location.hash='#/clients/new'">+ New Client</button></div>`;
+    return;
+  }
+  openModal({
+    title: isEdit ? 'Edit Project' : 'New Project',
+    fields: projectFormFields(),
+    initial: project || {status:'Planning', health:'Green'},
+    saveLabel: isEdit ? 'Save Changes' : 'Create Project',
+    onDelete: null,
+    onSave: async (data)=>{
+      if(isEdit){
+        await db.doc(`projects/${project.id}`).update(data);
+        if(data.status !== project.status) addActivity(project.id, data.name, `Status changed to ${data.status}`);
+        toast('Project updated', 'good');
+        location.hash = `#/project/${project.id}`;
+      } else {
+        const ref = await db.collection('projects').add({...data, createdAt:new Date().toISOString()});
+        addActivity(ref.id, data.name, 'Project created');
+        toast('Project created', 'good');
+        location.hash = `#/project/${ref.id}`;
+      }
+    }
+  });
+  document.getElementById('modalBackdrop').addEventListener('click', e=>{});
+  // if user cancels the modal on a dedicated route, send them back
+  const obs = document.getElementById('modalRoot');
+  const check = setInterval(()=>{ if(!document.getElementById('modalBackdrop')){ clearInterval(check); if(location.hash.endsWith('/new')) location.hash = isEdit? `#/project/${project.id}` : '#/projects'; } }, 200);
+}
+
+function renderProjectsList(app){
+  app.innerHTML = `
+    <div class="page-head">
+      <div><h1>Projects</h1><div class="lede">${projects.length} project${projects.length===1?'':'s'} on file.</div></div>
+      <button class="btn primary" onclick="location.hash='#/projects/new'">+ New Project</button>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div class="filters">
+          <input type="text" id="proj-search" placeholder="Search name, location, client…">
+          <select id="proj-status-filter"><option value="">All statuses</option>${PROJECT_STATUS.map(s=>`<option>${s}</option>`).join('')}</select>
+          <select id="proj-health-filter"><option value="">All health</option>${HEALTH_OPTS.map(h=>`<option>${h}</option>`).join('')}</select>
+        </div>
+      </div>
+      <div class="tblwrap"><table>
+        <thead><tr><th>Project</th><th>Client</th><th>Location</th><th>Status</th><th>Health</th><th class="num">Budget</th><th>Target</th></tr></thead>
+        <tbody id="proj-tbody"></tbody>
+      </table></div>
+    </div>`;
+  function draw(){
+    const q = document.getElementById('proj-search').value.toLowerCase();
+    const sf = document.getElementById('proj-status-filter').value;
+    const hf = document.getElementById('proj-health-filter').value;
+    const rows = projects.filter(p=>{
+      if(sf && p.status!==sf) return false;
+      if(hf && p.health!==hf) return false;
+      if(q){
+        const hay = (p.name+' '+(p.location||'')+' '+clientName(p.clientId)).toLowerCase();
+        if(!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    const tbody = document.getElementById('proj-tbody');
+    tbody.innerHTML = rows.length ? rows.map(p=>`
+      <tr class="clickable" onclick="location.hash='#/project/${p.id}'">
+        <td><strong>${escapeHtml(p.name)}</strong></td>
+        <td>${escapeHtml(clientName(p.clientId))}</td>
+        <td>${escapeHtml(p.location||'—')}</td>
+        <td>${pill(p.status,'dim')}</td>
+        <td>${dot(healthPillCls(p.health),p.health)}${escapeHtml(p.health||'—')}</td>
+        <td class="num">${fmtINR(p.budget)}</td>
+        <td>${fmtDate(p.targetDate)}</td>
+      </tr>`).join('') : `<tr class="empty-row"><td colspan="7">No projects match your filters.</td></tr>`;
+  }
+  ['proj-search','proj-status-filter','proj-health-filter'].forEach(id=>document.getElementById(id).addEventListener('input', draw));
+  draw();
+}
+
+/* ============================================================
+   PROJECT WORKSPACE
+   ============================================================ */
+function renderProjectWorkspace(app, id, tab){
+  const project = projects.find(p=>p.id===id);
+  if(!project){
+    app.innerHTML = `<div class="empty-state"><h2>Loading project…</h2><p>If this doesn't resolve, the project may not exist.</p><a class="btn" href="#/projects">← Back to Projects</a></div>`;
+    return;
+  }
+  ensureProjectSubs(id);
+  const tasks = taskListFor(id);
+  const boq = boqListFor(id);
+  const openTasks = tasks.filter(t=>t.status!=='Completed');
+  const overdue = openTasks.filter(t=>isOverdue(t.dueDate,t.status));
+  const boqTotal = boq.reduce((s,i)=>s+boqCalc(i).total,0);
+  const comp = projectCompletion(id);
+
+  app.innerHTML = `
+    <div class="crumb"><a href="#/projects">Projects</a> / ${escapeHtml(project.name)}</div>
+    <div class="proj-header">
+      <div class="proj-header-top">
+        <div>
+          <h1>${escapeHtml(project.name)}</h1>
+          <div class="lede" style="margin-top:4px;">${escapeHtml(clientName(project.clientId))}${project.location?' · '+escapeHtml(project.location):''}</div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          ${pill(project.status,'dim')}
+          <span>${dot(healthPillCls(project.health),project.health)}${escapeHtml(project.health||'—')}</span>
+          <button class="btn sm" onclick='openProjectEdit("${id}")'>Edit</button>
+        </div>
+      </div>
+      <div class="proj-meta">
+        <div class="mi"><span class="l">Project Manager</span><span class="v">${escapeHtml(project.projectManager||'—')}</span></div>
+        <div class="mi"><span class="l">Technical Lead</span><span class="v">${escapeHtml(project.technicalLead||'—')}</span></div>
+        <div class="mi"><span class="l">Site Engineer</span><span class="v">${escapeHtml(project.siteEngineer||'—')}</span></div>
+        <div class="mi"><span class="l">Start</span><span class="v">${fmtDate(project.startDate)}</span></div>
+        <div class="mi"><span class="l">Target</span><span class="v">${fmtDate(project.targetDate)}</span></div>
+        <div class="mi"><span class="l">Budget</span><span class="v">${fmtINR(project.budget)}</span></div>
+        <div class="mi"><span class="l">Actual Cost</span><span class="v">${fmtINR(project.actualCost)}</span></div>
+        <div class="mi"><span class="l">Completion</span><span class="v">${comp===null?'—':comp+'%'}</span></div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      ${tabLink(id,'overview','Overview',tab)}
+      ${tabLink(id,'rooms',`Rooms`,tab,pdata.rooms.length)}
+      ${tabLink(id,'boq',`BOQ`,tab,boq.length)}
+      ${tabLink(id,'tasks',`Tasks`,tab,tasks.length, overdue.length)}
+      ${tabLink(id,'documents',`Documents`,tab,pdata.docs.length)}
+    </div>
+    <div id="tab-slot"></div>
+  `;
+
+  const slot = document.getElementById('tab-slot');
+  if(tab==='rooms') return renderRoomsTab(slot, project);
+  if(tab==='boq') return renderBoqTab(slot, project, boq);
+  if(tab==='tasks') return renderTasksTab(slot, project, tasks);
+  if(tab==='documents') return renderDocumentsTab(slot, project);
+  return renderOverviewTab(slot, project, {tasks, openTasks, overdue, boq, boqTotal, comp});
+}
+function tabLink(id, key, label, current, count, badge){
+  return `<div class="tab ${current===key?'active':''}" onclick="location.hash='#/project/${id}/${key}'">${label}${count!==undefined?`<span class="cnt">${count}</span>`:''}${badge?` <span class="pill critical" style="margin-left:4px;">${badge}</span>`:''}</div>`;
+}
+function openProjectEdit(id){
+  const project = projects.find(p=>p.id===id);
+  const app = document.getElementById('app');
+  openModal({
+    title:'Edit Project', fields: projectFormFields(), initial: project, saveLabel:'Save Changes',
+    onSave: async (data)=>{
+      await db.doc(`projects/${id}`).update(data);
+      if(data.status !== project.status) addActivity(id, data.name, `Status changed to ${data.status}`);
+      toast('Project updated','good');
+    }
+  });
+}
+
+function renderOverviewTab(slot, project, {tasks, openTasks, overdue, boq, boqTotal, comp}){
+  slot.innerHTML = `
+    <div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);">
+      <div class="kpi-card"><div class="lbl">Rooms</div><div class="val">${pdata.rooms.length}</div></div>
+      <div class="kpi-card"><div class="lbl">BOQ Value</div><div class="val">${fmtINR(boqTotal)}</div><div class="sub">${boq.length} line items</div></div>
+      <div class="kpi-card"><div class="lbl">Open Tasks</div><div class="val">${openTasks.length}</div><div class="sub ${overdue.length?'critical':''}">${overdue.length} overdue</div></div>
+      <div class="kpi-card"><div class="lbl">Documents</div><div class="val">${pdata.docs.length}</div></div>
+    </div>
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><h3>Scope Summary</h3></div>
+        <div class="panel-body"><p style="margin:0; color:var(--text-dim); font-size:13px; white-space:pre-wrap;">${escapeHtml(project.scope || 'No scope summary recorded yet — add one from Edit.')}</p></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Activity Timeline</h3></div>
+        <div class="panel-body">
+          ${pdata.activity.length ? pdata.activity.map(a=>`<div class="activity-item"><span class="dot info"></span><div><div class="txt">${escapeHtml(a.text)}</div><div class="meta">${fmtDate((a.ts||'').slice(0,10))}</div></div></div>`).join('') : `<p style="color:var(--text-faint); font-size:12.6px; margin:0;">No activity recorded yet.</p>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+/* ---- Rooms tab ---- */
+function roomFormFields(){
+  return [
+    {key:'name', label:'Room / Area Name', required:true, wide:true},
+    {key:'building', label:'Building'},
+    {key:'floor', label:'Floor'},
+    {key:'type', label:'Type', type:'select', options:ROOM_TYPES},
+    {key:'status', label:'Status', type:'select', options:ROOM_STATUS},
+  ];
+}
+function renderRoomsTab(slot, project){
+  slot.innerHTML = `
+    <div class="panel">
+      <div class="panel-head"><h3>Rooms &amp; Areas</h3><button class="btn sm primary" onclick="openRoomForm('${project.id}')">+ Add Room</button></div>
+      <div class="tblwrap"><table>
+        <thead><tr><th>Name</th><th>Building</th><th>Floor</th><th>Type</th><th>Status</th><th class="num">BOQ Items</th><th class="num">Tasks</th><th></th></tr></thead>
+        <tbody>
+          ${pdata.rooms.length ? pdata.rooms.map(r=>{
+            const boqCount = boqListFor(project.id).filter(i=>i.roomId===r.id).length;
+            const taskCount = taskListFor(project.id).filter(t=>t.roomId===r.id).length;
+            return `<tr>
+              <td><strong>${escapeHtml(r.name)}</strong></td>
+              <td>${escapeHtml(r.building||'—')}</td>
+              <td>${escapeHtml(r.floor||'—')}</td>
+              <td>${escapeHtml(r.type||'—')}</td>
+              <td>${pill(r.status||'Not Started', roomStatusCls(r.status))}</td>
+              <td class="num">${boqCount}</td>
+              <td class="num">${taskCount}</td>
+              <td class="row-actions"><button class="icon-btn" onclick='openRoomForm("${project.id}", ${JSON.stringify(r).replace(/'/g,"&#39;")})'>✎</button></td>
+            </tr>`;
+          }).join('') : `<tr class="empty-row"><td colspan="8">No rooms yet — add the buildings/floors/rooms this project covers.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>`;
+}
+function openRoomForm(projectId, room){
+  openModal({
+    title: room ? 'Edit Room' : 'Add Room', fields: roomFormFields(),
+    initial: room || {status:'Not Started'}, saveLabel: room?'Save Changes':'Add Room',
+    onDelete: room ? async ()=>{ await db.doc(`projects/${projectId}/rooms/${room.id}`).delete(); toast('Room deleted','good'); } : null,
+    onSave: async (data)=>{
+      if(room){ await db.doc(`projects/${projectId}/rooms/${room.id}`).update(data); toast('Room updated','good'); }
+      else{ await db.collection(`projects/${projectId}/rooms`).add(data); addActivity(projectId, projects.find(p=>p.id===projectId).name, `Room "${data.name}" added`); toast('Room added','good'); }
+    }
+  });
+}
+
+/* ---- BOQ tab ---- */
+function boqFormFields(){
+  return [
+    {key:'category', label:'Category', type:'select', options:EQUIPMENT_CATEGORIES, required:true},
+    {key:'subCategory', label:'Sub Category'},
+    {key:'description', label:'Description', required:true, wide:true},
+    {key:'make', label:'Make'},
+    {key:'model', label:'Model'},
+    {key:'partNumber', label:'Part Number'},
+    {key:'roomId', label:'Room', type:'select', options:projectRoomOptions},
+    {key:'qty', label:'Qty', type:'number', required:true, step:'1'},
+    {key:'unit', label:'Unit', type:'select', options:UNITS},
+    {key:'rate', label:'Purchase Rate (₹)', type:'number', step:'1'},
+    {key:'marginPct', label:'Margin %', type:'number', step:'0.5'},
+    {key:'discountPct', label:'Discount %', type:'number', step:'0.5'},
+    {key:'gstPct', label:'GST %', type:'number', step:'0.5'},
+    {key:'vendor', label:'Vendor'},
+    {key:'leadTime', label:'Lead Time'},
+    {key:'availability', label:'Availability', type:'select', options:AVAILABILITY},
+    {key:'procurementStatus', label:'Procurement Status', type:'select', options:PROC_STATUS},
+    {key:'specification', label:'Specification', type:'textarea', wide:true, rows:2},
+    {key:'remarks', label:'Remarks', type:'textarea', wide:true, rows:2},
+  ];
+}
+function renderBoqTab(slot, project, boq){
+  slot.innerHTML = `
+    <div class="panel">
+      <div class="panel-head">
+        <div class="filters">
+          <input type="text" id="boq-search" placeholder="Search description, model, part no…">
+          <select id="boq-cat-filter"><option value="">All categories</option>${EQUIPMENT_CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn sm" onclick="openBoqFromLibrary('${project.id}')">+ From Library</button>
+          <button class="btn sm" id="boq-export">Export CSV</button>
+          <button class="btn sm primary" onclick="openBoqForm('${project.id}')">+ Add Item</button>
+        </div>
+      </div>
+      <div class="tblwrap"><table>
+        <thead><tr>
+          <th>Category</th><th>Description</th><th>Make / Model</th><th>Room</th><th class="num">Qty</th><th>Unit</th>
+          <th class="num">Rate</th><th class="num">Total</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody id="boq-tbody"></tbody>
+        <tfoot id="boq-tfoot"></tfoot>
+      </table></div>
+    </div>`;
+  function currentRows(){
+    const q = document.getElementById('boq-search').value.toLowerCase();
+    const cat = document.getElementById('boq-cat-filter').value;
+    return boq.filter(i=>{
+      if(cat && i.category!==cat) return false;
+      if(q){
+        const hay = (i.description+' '+(i.model||'')+' '+(i.partNumber||'')+' '+(i.make||'')).toLowerCase();
+        if(!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+  function draw(){
+    const rows = currentRows();
+    document.getElementById('boq-tbody').innerHTML = rows.length ? rows.map(i=>{
+      const c = boqCalc(i);
+      return `<tr class="clickable" onclick='openBoqForm("${project.id}", ${JSON.stringify(i).replace(/'/g,"&#39;")})'>
+        <td>${escapeHtml(i.category||'—')}</td>
+        <td><strong>${escapeHtml(i.description)}</strong>${i.partNumber?`<br><span class="mono" style="font-size:10.5px;color:var(--text-faint);">${escapeHtml(i.partNumber)}</span>`:''}</td>
+        <td>${escapeHtml([i.make,i.model].filter(Boolean).join(' / ')||'—')}</td>
+        <td>${escapeHtml(roomName(i.roomId))}</td>
+        <td class="num">${i.qty||0}</td>
+        <td>${escapeHtml(i.unit||'—')}</td>
+        <td class="num">${fmtINR(i.rate)}</td>
+        <td class="num"><strong>${fmtINR(c.total)}</strong></td>
+        <td>${pill(i.procurementStatus||'Not Required', procStatusCls(i.procurementStatus))}</td>
+        <td class="row-actions"><button class="icon-btn" onclick='event.stopPropagation(); deleteBoqItem("${project.id}","${i.id}")'>🗑</button></td>
+      </tr>`;
+    }).join('') : `<tr class="empty-row"><td colspan="10">No BOQ items match. Add items or adjust filters.</td></tr>`;
+    const totQty = rows.reduce((s,i)=>s+(Number(i.qty)||0),0);
+    const totAmt = rows.reduce((s,i)=>s+boqCalc(i).total,0);
+    document.getElementById('boq-tfoot').innerHTML = `<tr><td colspan="4">Totals (${rows.length} items)</td><td class="num">${totQty}</td><td></td><td></td><td class="num">${fmtINR(totAmt)}</td><td></td><td></td></tr>`;
+  }
+  ['boq-search','boq-cat-filter'].forEach(id=>document.getElementById(id).addEventListener('input', draw));
+  document.getElementById('boq-export').onclick = ()=>{
+    const rows = currentRows();
+    exportCSV(`BOQ_${project.name.replace(/[^a-z0-9]+/ig,'_')}.csv`,
+      ['Category','Sub Category','Description','Make','Model','Part Number','Room','Qty','Unit','Rate','Margin %','Discount %','GST %','Selling Rate','Line Total','Vendor','Lead Time','Availability','Procurement Status','Remarks'],
+      rows.map(i=>{ const c=boqCalc(i); return [i.category,i.subCategory,i.description,i.make,i.model,i.partNumber,roomName(i.roomId),i.qty,i.unit,i.rate,i.marginPct,i.discountPct,i.gstPct,c.sellRate.toFixed(2),c.total.toFixed(2),i.vendor,i.leadTime,i.availability,i.procurementStatus,i.remarks]; }));
+  };
+  draw();
+}
+function openBoqForm(projectId, item){
+  const isEdit = !!(item && item.id);
+  openModal({
+    title: isEdit ? 'Edit BOQ Item' : 'Add BOQ Item', fields: boqFormFields(),
+    initial: item || {qty:1, unit:'Nos', marginPct:20, discountPct:0, gstPct:18, availability:'Available', procurementStatus:'Not Required'},
+    saveLabel: isEdit?'Save Changes':'Add Item',
+    onDelete: isEdit ? async ()=>{ await deleteBoqItem(projectId, item.id, true); } : null,
+    onSave: async (data)=>{
+      if(isEdit){ await db.doc(`projects/${projectId}/boq_items/${item.id}`).update(data); toast('BOQ item updated','good'); }
+      else{ await db.collection(`projects/${projectId}/boq_items`).add(data); addActivity(projectId, projects.find(p=>p.id===projectId).name, `BOQ item added: ${data.description}`); toast('BOQ item added','good'); }
+    }
+  });
+}
+async function deleteBoqItem(projectId, itemId, skipConfirm){
+  if(!skipConfirm && !confirm('Delete this BOQ line item?')) return;
+  await db.doc(`projects/${projectId}/boq_items/${itemId}`).delete();
+  toast('BOQ item deleted','good');
+}
+function openBoqFromLibrary(projectId){
+  if(!equipment.length){ toast('Equipment Library is empty — add equipment first.', 'warn'); return; }
+  const root = document.getElementById('modalRoot');
+  root.innerHTML = `
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" style="max-width:720px;">
+      <div class="modal-head"><h3>Add from Equipment Library</h3><button class="icon-btn" onclick="closeModal()">✕</button></div>
+      <div style="padding:12px 20px 0;"><input type="text" id="lib-pick-search" placeholder="Search manufacturer, model, part number…" style="width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text);"></div>
+      <div class="modal-body" style="grid-template-columns:1fr; max-height:52vh;" id="lib-pick-list"></div>
+      <div class="modal-foot"><span class="hint" style="color:var(--text-faint); font-size:11.5px;">Click an item to add it to this project's BOQ.</span><button class="btn ghost" onclick="closeModal()">Cancel</button></div>
+    </div>
+  </div>`;
+  document.getElementById('modalBackdrop').addEventListener('mousedown', e=>{ if(e.target.id==='modalBackdrop') closeModal(); });
+  function draw(){
+    const q = document.getElementById('lib-pick-search').value.toLowerCase();
+    const rows = equipment.filter(e=>!q || (e.manufacturer+' '+e.model+' '+(e.partNumber||'')).toLowerCase().includes(q));
+    document.getElementById('lib-pick-list').innerHTML = rows.length ? `<div class="tblwrap"><table><thead><tr><th>Category</th><th>Manufacturer</th><th>Model</th><th class="num">Sell Price</th><th></th></tr></thead><tbody>${rows.map(e=>`
+      <tr class="clickable" onclick='pickLibraryItem("${projectId}", ${JSON.stringify(e).replace(/'/g,"&#39;")})'>
+        <td>${escapeHtml(e.category)}</td><td>${escapeHtml(e.manufacturer)}</td><td>${escapeHtml(e.model)}</td><td class="num">${fmtINR(e.sellingPrice)}</td>
+        <td><button class="btn sm primary">Use</button></td>
+      </tr>`).join('')}</tbody></table></div>` : `<p style="color:var(--text-faint); padding:16px;">No matches.</p>`;
+  }
+  document.getElementById('lib-pick-search').addEventListener('input', draw);
+  draw();
+}
+function pickLibraryItem(projectId, eq){
+  closeModal();
+  openBoqForm(projectId, {
+    category: eq.category, description: [eq.manufacturer, eq.model].filter(Boolean).join(' '),
+    make: eq.manufacturer, model: eq.model, partNumber: eq.partNumber, specification: eq.specification,
+    qty:1, unit:'Nos', rate: eq.purchasePrice||0, marginPct: eq.purchasePrice && eq.sellingPrice ? Math.round(((eq.sellingPrice-eq.purchasePrice)/eq.purchasePrice)*100) : 20,
+    discountPct:0, gstPct:18, availability:'Available', procurementStatus:'Not Required'
+  });
+}
+
+/* ---- Tasks tab ---- */
+function taskFormFields(){
+  return [
+    {key:'title', label:'Task', required:true, wide:true},
+    {key:'roomId', label:'Room', type:'select', options:projectRoomOptions},
+    {key:'responsible', label:'Responsible Person'},
+    {key:'priority', label:'Priority', type:'select', options:TASK_PRIORITY},
+    {key:'status', label:'Status', type:'select', options:TASK_STATUS},
+    {key:'startDate', label:'Start Date', type:'date'},
+    {key:'dueDate', label:'Due Date', type:'date'},
+    {key:'dependency', label:'Dependency', wide:true, placeholder:'e.g. Waiting on mount approval'},
+    {key:'remarks', label:'Remarks', type:'textarea', wide:true, rows:2},
+  ];
+}
+function renderTasksTab(slot, project, tasks){
+  slot.innerHTML = `
+    <div class="panel">
+      <div class="panel-head">
+        <div class="filters">
+          <select id="task-status-filter"><option value="">All statuses</option>${TASK_STATUS.map(s=>`<option>${s}</option>`).join('')}</select>
+          <label style="display:flex; align-items:center; gap:5px; font-size:12.5px; color:var(--text-dim);"><input type="checkbox" id="task-overdue-only"> Overdue only</label>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn sm" id="task-export">Export CSV</button>
+          <button class="btn sm primary" onclick="openTaskForm('${project.id}')">+ Add Task</button>
+        </div>
+      </div>
+      <div class="tblwrap"><table>
+        <thead><tr><th>Task</th><th>Room</th><th>Responsible</th><th>Priority</th><th>Status</th><th>Due</th><th></th></tr></thead>
+        <tbody id="task-tbody"></tbody>
+      </table></div>
+    </div>`;
+  function currentRows(){
+    const sf = document.getElementById('task-status-filter').value;
+    const overdueOnly = document.getElementById('task-overdue-only').checked;
+    return tasks.filter(t=>{
+      if(sf && t.status!==sf) return false;
+      if(overdueOnly && !isOverdue(t.dueDate,t.status)) return false;
+      return true;
+    }).slice().sort((a,b)=>(a.dueDate||'9999').localeCompare(b.dueDate||'9999'));
+  }
+  function draw(){
+    const rows = currentRows();
+    document.getElementById('task-tbody').innerHTML = rows.length ? rows.map(t=>`
+      <tr class="clickable ${isOverdue(t.dueDate,t.status)?'overdue':''}" onclick='openTaskForm("${project.id}", ${JSON.stringify(t).replace(/'/g,"&#39;")})'>
+        <td><strong>${escapeHtml(t.title)}</strong>${t.dependency?`<br><span style="font-size:11px;color:var(--text-faint);">↳ ${escapeHtml(t.dependency)}</span>`:''}</td>
+        <td>${escapeHtml(roomName(t.roomId))}</td>
+        <td>${escapeHtml(t.responsible||'—')}</td>
+        <td>${pill(t.priority||'Medium', priorityCls(t.priority))}</td>
+        <td>${pill(t.status||'Not Started', taskStatusCls(t.status))}</td>
+        <td>${fmtDate(t.dueDate)}</td>
+        <td class="row-actions"><button class="icon-btn" onclick='event.stopPropagation(); deleteTask("${project.id}","${t.id}")'>🗑</button></td>
+      </tr>`).join('') : `<tr class="empty-row"><td colspan="7">No tasks match.</td></tr>`;
+  }
+  ['task-status-filter','task-overdue-only'].forEach(id=>document.getElementById(id).addEventListener('input', draw));
+  document.getElementById('task-export').onclick = ()=>{
+    const rows = currentRows();
+    exportCSV(`Tasks_${project.name.replace(/[^a-z0-9]+/ig,'_')}.csv`,
+      ['Task','Room','Responsible','Priority','Status','Start','Due','Dependency','Remarks'],
+      rows.map(t=>[t.title, roomName(t.roomId), t.responsible, t.priority, t.status, t.startDate, t.dueDate, t.dependency, t.remarks]));
+  };
+  draw();
+}
+function openTaskForm(projectId, task){
+  openModal({
+    title: task ? 'Edit Task' : 'Add Task', fields: taskFormFields(),
+    initial: task || {priority:'Medium', status:'Not Started'}, saveLabel: task?'Save Changes':'Add Task',
+    onDelete: task ? async ()=>{ await deleteTask(projectId, task.id, true); } : null,
+    onSave: async (data)=>{
+      if(task){ await db.doc(`projects/${projectId}/tasks/${task.id}`).update(data); toast('Task updated','good'); }
+      else{ await db.collection(`projects/${projectId}/tasks`).add(data); addActivity(projectId, projects.find(p=>p.id===projectId).name, `Task added: ${data.title}`); toast('Task added','good'); }
+    }
+  });
+}
+async function deleteTask(projectId, taskId, skipConfirm){
+  if(!skipConfirm && !confirm('Delete this task?')) return;
+  await db.doc(`projects/${projectId}/tasks/${taskId}`).delete();
+  toast('Task deleted','good');
+}
+
+/* ---- Documents tab ---- */
+function docFormFields(){
+  return [
+    {key:'name', label:'Document Name', required:true, wide:true},
+    {key:'category', label:'Category', type:'select', options:DOC_CATEGORY},
+    {key:'revision', label:'Revision', placeholder:'V1'},
+    {key:'status', label:'Status', type:'select', options:DOC_STATUS},
+    {key:'date', label:'Date', type:'date'},
+    {key:'author', label:'Author'},
+    {key:'relatedRoomId', label:'Related Room', type:'select', options:projectRoomOptions},
+    {key:'reference', label:'Reference / Link / Location', wide:true, placeholder:'e.g. Drive link, drawing no., physical folder'},
+    {key:'notes', label:'Notes', type:'textarea', wide:true, rows:2},
+  ];
+}
+function renderDocumentsTab(slot, project){
+  const docs = pdata.docs;
+  slot.innerHTML = `
+    <div class="panel">
+      <div class="panel-head"><h3>Document Register</h3><button class="btn sm primary" onclick="openDocForm('${project.id}')">+ Add Document</button></div>
+      <div class="tblwrap"><table>
+        <thead><tr><th>Name</th><th>Category</th><th>Rev</th><th>Status</th><th>Date</th><th>Author</th><th></th></tr></thead>
+        <tbody>
+          ${docs.length ? docs.slice().sort((a,b)=>(b.date||'').localeCompare(a.date||'')).map(d=>`
+            <tr class="clickable" onclick='openDocForm("${project.id}", ${JSON.stringify(d).replace(/'/g,"&#39;")})'>
+              <td><strong>${escapeHtml(d.name)}</strong>${d.reference?`<br><span style="font-size:11px;color:var(--text-faint);">${escapeHtml(d.reference)}</span>`:''}</td>
+              <td>${escapeHtml(d.category||'—')}</td>
+              <td class="mono">${escapeHtml(d.revision||'—')}</td>
+              <td>${pill(d.status||'Draft', docStatusCls(d.status))}</td>
+              <td>${fmtDate(d.date)}</td>
+              <td>${escapeHtml(d.author||'—')}</td>
+              <td class="row-actions"><button class="icon-btn" onclick='event.stopPropagation(); deleteDoc("${project.id}","${d.id}")'>🗑</button></td>
+            </tr>`).join('') : `<tr class="empty-row"><td colspan="7">No documents logged yet.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>`;
+}
+function openDocForm(projectId, doc){
+  openModal({
+    title: doc ? 'Edit Document' : 'Add Document', fields: docFormFields(),
+    initial: doc || {revision:'V1', status:'Draft', date: todayStr()}, saveLabel: doc?'Save Changes':'Add Document',
+    onDelete: doc ? async ()=>{ await deleteDoc(projectId, doc.id, true); } : null,
+    onSave: async (data)=>{
+      if(doc){ await db.doc(`projects/${projectId}/documents/${doc.id}`).update(data); toast('Document updated','good'); }
+      else{ await db.collection(`projects/${projectId}/documents`).add(data); addActivity(projectId, projects.find(p=>p.id===projectId).name, `Document added: ${data.name}`); toast('Document added','good'); }
+    }
+  });
+}
+async function deleteDoc(projectId, docId, skipConfirm){
+  if(!skipConfirm && !confirm('Delete this document record?')) return;
+  await db.doc(`projects/${projectId}/documents/${docId}`).delete();
+  toast('Document deleted','good');
+}
+
+/* ============================================================
+   CLIENTS
+   ============================================================ */
+function clientFormFields(){
+  return [
+    {key:'name', label:'Company Name', required:true, wide:true},
+    {key:'contactPerson', label:'Contact Person'},
+    {key:'designation', label:'Designation'},
+    {key:'email', label:'Email', type:'email'},
+    {key:'phone', label:'Phone'},
+    {key:'whatsapp', label:'WhatsApp'},
+    {key:'address', label:'Address', type:'textarea', wide:true, rows:2},
+    {key:'notes', label:'Notes', type:'textarea', wide:true, rows:2},
+  ];
+}
+function renderClientForm(app){
+  app.innerHTML = `<div class="crumb"><a href="#/clients">Clients</a> / New</div><div class="page-head"><h1>New Client</h1></div>`;
+  openModal({
+    title:'New Client', fields: clientFormFields(), initial:{}, saveLabel:'Create Client',
+    onSave: async (data)=>{
+      const ref = await db.collection('clients').add({...data, createdAt:new Date().toISOString()});
+      toast('Client created','good');
+      location.hash = `#/client/${ref.id}`;
+    }
+  });
+  const check = setInterval(()=>{ if(!document.getElementById('modalBackdrop')){ clearInterval(check); if(location.hash.endsWith('/new')) location.hash='#/clients'; } }, 200);
+}
+function renderClientsList(app){
+  app.innerHTML = `
+    <div class="page-head">
+      <div><h1>Clients</h1><div class="lede">${clients.length} client${clients.length===1?'':'s'} on file.</div></div>
+      <button class="btn primary" onclick="location.hash='#/clients/new'">+ New Client</button>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><div class="filters"><input type="text" id="client-search" placeholder="Search company, contact, email…"></div></div>
+      <div class="tblwrap"><table>
+        <thead><tr><th>Company</th><th>Contact</th><th>Phone</th><th>Email</th><th class="num">Projects</th><th></th></tr></thead>
+        <tbody id="client-tbody"></tbody>
+      </table></div>
+    </div>`;
+  if(!clients.length){
+    document.querySelector('.panel').innerHTML = `<div class="empty-state"><h2>No clients yet</h2><p>Add your first client to start a project.</p><button class="btn primary" onclick="location.hash='#/clients/new'">+ New Client</button></div>`;
+    return;
+  }
+  function draw(){
+    const q = document.getElementById('client-search').value.toLowerCase();
+    const rows = clients.filter(c=>!q || (c.name+' '+(c.contactPerson||'')+' '+(c.email||'')).toLowerCase().includes(q));
+    document.getElementById('client-tbody').innerHTML = rows.length ? rows.map(c=>`
+      <tr class="clickable" onclick="location.hash='#/client/${c.id}'">
+        <td><strong>${escapeHtml(c.name)}</strong></td>
+        <td>${escapeHtml(c.contactPerson||'—')}</td>
+        <td>${escapeHtml(c.phone||'—')}</td>
+        <td>${escapeHtml(c.email||'—')}</td>
+        <td class="num">${projects.filter(p=>p.clientId===c.id).length}</td>
+        <td class="row-actions"><button class="icon-btn" onclick='event.stopPropagation(); deleteClient("${c.id}").catch(e=>toast(e.message,"critical",5000))'>🗑</button></td>
+      </tr>`).join('') : `<tr class="empty-row"><td colspan="6">No clients match your search.</td></tr>`;
+  }
+  document.getElementById('client-search').addEventListener('input', draw);
+  draw();
+}
+function renderClientDetail(app, id){
+  const client = clients.find(c=>c.id===id);
+  if(!client){ app.innerHTML = `<div class="empty-state"><h2>Client not found</h2><a class="btn" href="#/clients">← Back to Clients</a></div>`; return; }
+  const linked = projects.filter(p=>p.clientId===id);
+  app.innerHTML = `
+    <div class="crumb"><a href="#/clients">Clients</a> / ${escapeHtml(client.name)}</div>
+    <div class="page-head">
+      <div><h1>${escapeHtml(client.name)}</h1><div class="lede">${escapeHtml(client.contactPerson||'')}${client.designation?', '+escapeHtml(client.designation):''}</div></div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn" onclick='openClientEdit("${id}")'>Edit</button>
+        <button class="btn danger-ghost" onclick='deleteClient("${id}").catch(e=>toast(e.message,"critical",5000))'>Delete</button>
+      </div>
+    </div>
+    <div class="two-col">
+      <div>
+        <div class="panel">
+          <div class="panel-head"><h3>Projects (${linked.length})</h3><button class="btn sm primary" onclick="location.hash='#/projects/new'">+ New Project</button></div>
+          <div class="tblwrap"><table>
+            <thead><tr><th>Project</th><th>Status</th><th>Health</th><th>Target</th><th class="num">Budget</th></tr></thead>
+            <tbody>
+              ${linked.length ? linked.map(p=>`<tr class="clickable" onclick="location.hash='#/project/${p.id}'">
+                <td><strong>${escapeHtml(p.name)}</strong></td><td>${pill(p.status,'dim')}</td>
+                <td>${dot(healthPillCls(p.health),p.health)}${escapeHtml(p.health||'—')}</td>
+                <td>${fmtDate(p.targetDate)}</td><td class="num">${fmtINR(p.budget)}</td></tr>`).join('') : `<tr class="empty-row"><td colspan="5">No projects for this client yet.</td></tr>`}
+            </tbody>
+          </table></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Contact</h3></div>
+        <div class="panel-body" style="display:flex; flex-direction:column; gap:10px; font-size:12.8px;">
+          <div><span style="color:var(--text-faint); font-size:10.8px; text-transform:uppercase; font-family:'IBM Plex Mono';">Email</span><br>${escapeHtml(client.email||'—')}</div>
+          <div><span style="color:var(--text-faint); font-size:10.8px; text-transform:uppercase; font-family:'IBM Plex Mono';">Phone</span><br>${escapeHtml(client.phone||'—')}</div>
+          <div><span style="color:var(--text-faint); font-size:10.8px; text-transform:uppercase; font-family:'IBM Plex Mono';">WhatsApp</span><br>${escapeHtml(client.whatsapp||'—')}</div>
+          <div><span style="color:var(--text-faint); font-size:10.8px; text-transform:uppercase; font-family:'IBM Plex Mono';">Address</span><br>${escapeHtml(client.address||'—')}</div>
+          ${client.notes?`<div><span style="color:var(--text-faint); font-size:10.8px; text-transform:uppercase; font-family:'IBM Plex Mono';">Notes</span><br>${escapeHtml(client.notes)}</div>`:''}
+        </div>
+      </div>
+    </div>`;
+}
+function openClientEdit(id){
+  const client = clients.find(c=>c.id===id);
+  openModal({
+    title:'Edit Client', fields: clientFormFields(), initial: client, saveLabel:'Save Changes',
+    onDelete: async ()=>{ await deleteClient(id, true); location.hash = '#/clients'; },
+    onSave: async (data)=>{ await db.doc(`clients/${id}`).update(data); toast('Client updated','good'); }
+  });
+}
+async function deleteClient(id, skipConfirm){
+  const linked = projects.filter(p=>p.clientId===id).length;
+  if(linked){
+    throw new Error(`${linked} project${linked===1?'':'s'} still linked to this client — reassign or delete ${linked===1?'it':'them'} first.`);
+  }
+  if(!skipConfirm && !confirm('Delete this client? This cannot be undone.')) return;
+  await db.doc(`clients/${id}`).delete();
+  toast('Client deleted','good');
+  if(location.hash.startsWith('#/client/'+id)) location.hash = '#/clients';
+}
+
+/* ============================================================
+   EQUIPMENT LIBRARY
+   ============================================================ */
+function equipmentFormFields(){
+  return [
+    {key:'category', label:'Category', type:'select', options:EQUIPMENT_CATEGORIES, required:true},
+    {key:'manufacturer', label:'Manufacturer', required:true},
+    {key:'model', label:'Model', required:true},
+    {key:'partNumber', label:'Part Number'},
+    {key:'purchasePrice', label:'Purchase Price (₹)', type:'number', step:'1'},
+    {key:'sellingPrice', label:'Selling Price (₹)', type:'number', step:'1'},
+    {key:'dimensions', label:'Dimensions'},
+    {key:'weight', label:'Weight'},
+    {key:'powerConsumption', label:'Power Consumption'},
+    {key:'resolution', label:'Resolution'},
+    {key:'input', label:'Input'},
+    {key:'output', label:'Output'},
+    {key:'connectivity', label:'Connectivity'},
+    {key:'warranty', label:'Warranty'},
+    {key:'specification', label:'Specification', type:'textarea', wide:true, rows:2},
+    {key:'notes', label:'Installation / Mounting Notes', type:'textarea', wide:true, rows:2},
+  ];
+}
+function renderEquipmentLibrary(app){
+  app.innerHTML = `
+    <div class="page-head">
+      <div><h1>Equipment Library</h1><div class="lede">${equipment.length} product${equipment.length===1?'':'s'} in the reusable catalog.</div></div>
+      <button class="btn primary" onclick="openEquipmentForm()">+ Add Equipment</button>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div class="filters">
+          <input type="text" id="eq-search" placeholder="Search manufacturer, model, part number…">
+          <select id="eq-cat-filter"><option value="">All categories</option>${EQUIPMENT_CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select>
+        </div>
+      </div>
+      <div class="tblwrap"><table>
+        <thead><tr><th>Category</th><th>Manufacturer</th><th>Model</th><th>Part Number</th><th class="num">Purchase</th><th class="num">Selling</th><th></th></tr></thead>
+        <tbody id="eq-tbody"></tbody>
+      </table></div>
+    </div>`;
+  if(!equipment.length){
+    document.querySelector('.panel').innerHTML = `<div class="empty-state"><h2>Library is empty</h2><p>Add manufacturers, models and specs once — reuse them across every project's BOQ.</p><button class="btn primary" onclick="openEquipmentForm()">+ Add Equipment</button></div>`;
+    return;
+  }
+  function draw(){
+    const q = document.getElementById('eq-search').value.toLowerCase();
+    const cat = document.getElementById('eq-cat-filter').value;
+    const rows = equipment.filter(e=>{
+      if(cat && e.category!==cat) return false;
+      if(q && !(e.manufacturer+' '+e.model+' '+(e.partNumber||'')).toLowerCase().includes(q)) return false;
+      return true;
+    });
+    document.getElementById('eq-tbody').innerHTML = rows.length ? rows.map(e=>`
+      <tr class="clickable" onclick='openEquipmentForm(${JSON.stringify(e).replace(/'/g,"&#39;")})'>
+        <td>${escapeHtml(e.category)}</td><td><strong>${escapeHtml(e.manufacturer)}</strong></td><td>${escapeHtml(e.model)}</td>
+        <td class="mono">${escapeHtml(e.partNumber||'—')}</td><td class="num">${fmtINR(e.purchasePrice)}</td><td class="num">${fmtINR(e.sellingPrice)}</td>
+        <td class="row-actions"><button class="icon-btn" onclick='event.stopPropagation(); deleteEquipment("${e.id}")'>🗑</button></td>
+      </tr>`).join('') : `<tr class="empty-row"><td colspan="7">No equipment matches.</td></tr>`;
+  }
+  ['eq-search','eq-cat-filter'].forEach(id=>document.getElementById(id).addEventListener('input', draw));
+  draw();
+}
+function openEquipmentForm(eq){
+  openModal({
+    title: eq ? 'Edit Equipment' : 'Add Equipment', fields: equipmentFormFields(),
+    initial: eq || {}, saveLabel: eq?'Save Changes':'Add Equipment',
+    onDelete: eq ? async ()=>{ await deleteEquipment(eq.id, true); } : null,
+    onSave: async (data)=>{
+      if(eq){ await db.doc(`equipment_library/${eq.id}`).update(data); toast('Equipment updated','good'); }
+      else{ await db.collection('equipment_library').add(data); toast('Equipment added to library','good'); }
+    }
+  });
+}
+async function deleteEquipment(id, skipConfirm){
+  if(!skipConfirm && !confirm('Remove this item from the Equipment Library?')) return;
+  await db.doc(`equipment_library/${id}`).delete();
+  toast('Equipment removed','good');
+}
+
+/* ============================================================
+   BOOT
+   ============================================================ */
+async function boot(){
+  try{ db = await claude.use('db'); }catch(e){ db = null; }
+  try{ downloadsCap = await claude.use('downloads'); }catch(e){ downloadsCap = null; }
+
+  if(!db){
+    document.getElementById('app').innerHTML = `<div class="empty-state"><h2>Live data isn't available in this view</h2><p>Open this page from Claude to use the Command Center with your real project data.</p></div>`;
+    return;
+  }
+
+  db.collection('clients').onSnapshot(snap=>{
+    clients = snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(a.name||'').localeCompare(b.name||''));
+    scheduleRender();
+  }, err=>console.error('clients sub', err));
+
+  db.collection('projects').onSnapshot(snap=>{
+    projects = snap.docs.map(d=>({id:d.id,...d.data()}));
+    syncPortfolioSubs();
+    scheduleRender();
+  }, err=>console.error('projects sub', err));
+
+  db.collection('equipment_library').onSnapshot(snap=>{
+    equipment = snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(a.manufacturer||'').localeCompare(b.manufacturer||''));
+    scheduleRender();
+  }, err=>console.error('equipment sub', err));
+
+  window.addEventListener('hashchange', renderRoute);
+  renderRoute();
+}
+boot();
+</script>
+
+</body>
+</html>
